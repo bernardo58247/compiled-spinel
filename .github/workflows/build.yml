@@ -83,7 +83,7 @@ jobs:
             pkg-config \
             libssl-dev \
             libffi-dev \
-            libsqlite3-dev
+            libsqlite3-dev 
 
       - name: build glibc
         if: matrix.libc == 'gnu'
@@ -137,7 +137,8 @@ jobs:
                 pkgconf \
                 openssl-dev \
                 libffi-dev \
-                sqlite-dev
+                sqlite-dev \
+                ruby
 
               make deps
               make
