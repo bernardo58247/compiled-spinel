@@ -1,0 +1,191 @@
+
+name: build spinel
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      should_build: ${{ steps.detect.outputs.should_build }}
+
+    steps:
+      - name: detect latest upstream version
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+
+          VERSION=$(
+            git ls-remote --tags --refs \
+              https://github.com/matz/spinel.git |
+            awk '{sub("refs/tags/", "", $2); print $2}' |
+            grep -E '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$' |
+            sort -V |
+            tail -n 1
+          )
+
+          if [ -z "$VERSION" ]; then
+            echo "nenhuma versão encontrada"
+            exit 1
+          fi
+
+          echo "versão upstream: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release já existe"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "nova versão encontrada!"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        libc: [gnu, musl]
+
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+
+    steps:
+      - name: checkout spinel
+        uses: actions/checkout@v4
+        with:
+          repository: matz/spinel
+          ref: ${{ needs.check.outputs.version }}
+
+      - name: install glibc dependencies
+        if: matrix.libc == 'gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            make \
+            git \
+            curl \
+            xz-utils \
+            pkg-config \
+            libssl-dev \
+            libffi-dev \
+            libsqlite3-dev
+
+      - name: build glibc
+        if: matrix.libc == 'gnu'
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eux
+
+          make deps
+          make
+
+          make install PREFIX="$GITHUB_WORKSPACE/stage/usr"
+
+          mkdir -p stage/usr/bin
+
+          ln -sfn ../lib/spinel/spinel \
+            stage/usr/bin/spinel
+
+          ln -sfn ../lib/spinel/spin \
+            stage/usr/bin/spin
+
+          ln -sfn ../lib/spinel/spinel-cext-build \
+            stage/usr/bin/spinel-cext-build
+
+          tar -C stage -cJf \
+            "spinel-${VERSION}-${ARCH}-linux-gnu.tar.xz" usr
+
+      - name: build musl
+        if: matrix.libc == 'musl'
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eux
+
+          docker run --rm \
+            -e VERSION="$VERSION" \
+            -e ARCH="$ARCH" \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            alpine:3.22 \
+            sh -euxc '
+              apk add --no-cache \
+                build-base \
+                make \
+                git \
+                curl \
+                xz \
+                tar \
+                pkgconf \
+                openssl-dev \
+                libffi-dev \
+                sqlite-dev
+
+              make deps
+              make
+
+              make install PREFIX=/src/stage/usr
+
+              mkdir -p /src/stage/usr/bin
+
+              ln -sfn ../lib/spinel/spinel \
+                /src/stage/usr/bin/spinel
+
+              ln -sfn ../lib/spinel/spin \
+                /src/stage/usr/bin/spin
+
+              ln -sfn ../lib/spinel/spinel-cext-build \
+                /src/stage/usr/bin/spinel-cext-build
+
+              tar -C /src/stage -cJf \
+                "/src/spinel-${VERSION}-${ARCH}-linux-musl.tar.xz" usr
+            '
+
+      - name: upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spinel-${{ matrix.arch }}-${{ matrix.libc }}
+          path: spinel-*.tar.xz
+          if-no-files-found: error
+
+  release:
+    needs: [check, build]
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: download all builds
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -eux
+
+          gh release create "$VERSION" dist/*.tar.xz \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Spinel $VERSION" \
+            --generate-notes
